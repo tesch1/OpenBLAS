@@ -39,10 +39,11 @@ THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *    for column tails of half a panel or more, and an edge kernel with all tiles along M.
  *  - Four-row ZA moves (MOVA vg4) for the C tiles and for the transposition of A, core-side L2 prefetch.
  *  - One thread per SME unit (Apple: per performance cluster) when the problem is large enough.
- *  - Problems of fewer than S2_SMALL_WORK multiply-adds run in plain loops, below the cost of streaming mode.
+ *  - Problems of fewer than S2_SMALL_WORK multiply-adds run on NEON (sme2_gemm_small.h), below the cost of streaming mode.
  */
 
 #include "sme2_gemm_tile.h"
+#include "sme2_gemm_small.h"
 #include "sme2_gemm_detect.h"
 #include <stdlib.h>
 #include <string.h>
@@ -605,53 +606,32 @@ static int s2_routine(blas_arg_t *args, BLASLONG *range_m, BLASLONG *range_n, FL
 
 #define S2_MAX_PARTS 4
 #ifndef S2_SMALL_WORK
-#define S2_SMALL_WORK 3000. /* multiply-adds below which s2_small is faster (Apple M4, both precisions) */
+#ifdef DOUBLE
+#define S2_SMALL_WORK 12000. /* multiply-adds below which s2_small is faster (Apple M4) */
+#else
+#define S2_SMALL_WORK 16000.
+#endif
 #endif
 
-/* Column-major GEMM in plain loops (vectorized for NEON) for problems smaller than the cost of streaming mode. */
+/* Column-major GEMM in NEON registers for problems smaller than the cost of streaming mode. */
 static void s2_small(int trans_a, int trans_b, BLASLONG m, BLASLONG n, BLASLONG k, FLOAT alpha, const FLOAT *a,
                      BLASLONG lda, const FLOAT *b, BLASLONG ldb, FLOAT beta, FLOAT *c, BLASLONG ldc) {
-  const BLASLONG sbl = trans_b ? ldb : 1, sbj = trans_b ? 1 : ldb; /* stride of B along l and along j */
-  for (BLASLONG j = 0; j < n; ++j) {
-    FLOAT *cj = c + j * ldc;
-    if (beta == (FLOAT)0)
-      for (BLASLONG i = 0; i < m; ++i) cj[i] = 0;
-    else if (beta != (FLOAT)1)
-      for (BLASLONG i = 0; i < m; ++i) cj[i] *= beta;
-  }
-  if (trans_a) {
-    for (BLASLONG j = 0; j < n; ++j)
-      for (BLASLONG i = 0; i < m; ++i) {
-        const FLOAT *ai = a + i * lda, *bj = b + j * sbj;
-        FLOAT s = 0;
-        for (BLASLONG l = 0; l < k; ++l) s += ai[l] * bj[l * sbl];
-        c[i + j * ldc] += alpha * s;
-      }
+  if (!trans_a) {
+    s2s_gemm_n(trans_b, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc);
     return;
   }
-  BLASLONG j = 0;
-  for (; j + 4 <= n; j += 4) {
-    FLOAT *c0 = c + j * ldc, *c1 = c0 + ldc, *c2 = c1 + ldc, *c3 = c2 + ldc;
-    const FLOAT *bj = b + j * sbj;
-    for (BLASLONG l = 0; l < k; ++l) {
-      const FLOAT *al = a + l * lda, *bl = bj + l * sbl;
-      const FLOAT t0 = alpha * bl[0], t1 = alpha * bl[sbj], t2 = alpha * bl[2 * sbj], t3 = alpha * bl[3 * sbj];
-      for (BLASLONG i = 0; i < m; ++i) {
-        const FLOAT x = al[i];
-        c0[i] += t0 * x;
-        c1[i] += t1 * x;
-        c2[i] += t2 * x;
-        c3[i] += t3 * x;
-      }
-    }
+  if (!trans_b) {
+    s2s_gemm_tn(m, n, k, alpha, a, lda, b, ldb, beta, c, ldc);
+    return;
   }
-  for (; j < n; ++j) {
-    FLOAT *cj = c + j * ldc;
-    for (BLASLONG l = 0; l < k; ++l) {
-      const FLOAT t = alpha * b[j * sbj + l * sbl], *al = a + l * lda;
-      for (BLASLONG i = 0; i < m; ++i) cj[i] += t * al[i];
+  for (BLASLONG j = 0; j < n; ++j) /* both transposed: plain loops */
+    for (BLASLONG i = 0; i < m; ++i) {
+      const FLOAT *ai = a + i * lda, *bj = b + j;
+      FLOAT s = 0;
+      for (BLASLONG l = 0; l < k; ++l) s += ai[l] * bj[l * ldb];
+      FLOAT *cc = c + i + j * ldc;
+      *cc = alpha * s + (beta == (FLOAT)0 ? (FLOAT)0 : beta * *cc);
     }
-  }
 }
 
 /* Column-major C = alpha op(A) op(B) + beta C, solved as the row-major C^T = alpha op(B)^T op(A)^T + beta C^T. */
